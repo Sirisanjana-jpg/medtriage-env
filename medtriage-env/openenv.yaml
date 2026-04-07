@@ -1,0 +1,106 @@
+name: MedTriageEnv
+version: "1.0.0"
+description: >
+  Clinical Decision Support RL Environment simulating emergency department
+  triage workflows. Agents must perform real tasks that ED nurses and physicians
+  do daily: extracting vital signs from unstructured notes, identifying dangerous
+  drug-drug interactions, and producing ranked differential diagnoses.
+tags:
+  - openenv
+  - medtech
+  - clinical
+  - triage
+  - nlp
+  - decision-support
+
+author: MedTriageEnv Team
+license: MIT
+
+tasks:
+  - id: T1_vitals
+    name: Vital Signs Extraction
+    difficulty: easy
+    description: >
+      Extract structured vital signs (HR, BP, SpO2, temperature, RR) from
+      unstructured nurse admission notes. Returns F1-based score per vital.
+    num_cases: 3
+    reward_range: [0.0, 1.0]
+    reward_type: continuous
+    episode_steps: 1
+
+  - id: T2_drug_interactions
+    name: Drug Interaction Flagging
+    difficulty: medium
+    description: >
+      Identify clinically significant drug-drug interactions from a patient's
+      medication list. Graded by precision/recall F1 on interaction pairs detected.
+    num_cases: 3
+    reward_range: [0.0, 1.0]
+    reward_type: continuous
+    episode_steps: 1
+
+  - id: T3_differential_diagnosis
+    name: Differential Diagnosis Ranking
+    difficulty: hard
+    description: >
+      Given a complete emergency presentation, produce a ranked differential
+      diagnosis list. Scored by NDCG (rank-weighted), critical diagnosis presence,
+      workup completeness, and disposition accuracy.
+    num_cases: 3
+    reward_range: [0.0, 1.0]
+    reward_type: continuous
+    episode_steps: 1
+
+observation_space:
+  type: text
+  description: >
+    Structured patient record rendered as a natural language prompt including:
+    patient demographics, chief complaint, nurse notes, medication list,
+    allergies, medical history, and task-specific instructions.
+
+action_space:
+  type: text
+  description: >
+    Natural language response from agent, expected to contain a JSON object
+    matching the task-specific schema (vitals dict / interactions list / differentials list).
+
+api:
+  endpoints:
+    - path: /reset
+      method: POST
+      description: Start a new episode
+    - path: /step
+      method: POST
+      description: Submit an action and receive reward
+    - path: /state
+      method: GET
+      description: Query current environment state
+    - path: /tasks
+      method: GET
+      description: List available tasks
+    - path: /health
+      method: GET
+      description: Health check
+
+docker:
+  base_image: python:3.11-slim
+  port: 7860
+  build_command: docker build -t medtriage-env .
+  run_command: docker run -p 7860:7860 medtriage-env
+
+huggingface:
+  space_type: docker
+  sdk: docker
+  tags:
+    - openenv
+    - rl-environment
+    - medtech
+
+baseline:
+  script: inference.py
+  model: gpt-4o-mini
+  expected_scores:
+    T1_vitals: ~0.92
+    T2_drug_interactions: ~0.78
+    T3_differential_diagnosis: ~0.61
+  overall: ~0.77
