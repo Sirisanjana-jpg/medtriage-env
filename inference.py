@@ -1,58 +1,49 @@
+"""
+inference.py - MedTriageEnv baseline inference script
+Structured stdout: [START], [STEP], [END] format
+"""
 import os
 import sys
-import json
 import time
 import traceback
- 
-# ── Load .env file if present ─────────────────────────────────────
+
+# Load .env file
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv not installed, fall back to system env vars
- 
-# ── Config from environment ───────────────────────────────────────
+    pass
+
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "llama-3.3-70b-versatile")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     os.environ.get("OPENAI_API_KEY", ""))
- 
+
 if not HF_TOKEN:
-    print(
-        "ERROR: HF_TOKEN not set.\n"
-        "  For Groq:   set HF_TOKEN=gsk_your_key in .env\n"
-        "  For OpenAI: set HF_TOKEN=sk-proj-your_key in .env",
-        file=sys.stderr
-    )
+    print("ERROR: HF_TOKEN not set.", file=sys.stderr)
     sys.exit(1)
- 
-# ── OpenAI client (works with Groq, OpenAI, Together, etc.) ───────
+
 from openai import OpenAI
- 
-client = OpenAI(
-    api_key=HF_TOKEN,
-    base_url=API_BASE_URL,
-)
- 
-# ── Import MedTriageEnv ───────────────────────────────────────────
+client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env.environment import MedTriageEnv, TASK_ORDER, TASKS
 from env.models import Action
- 
- 
-# ── System prompt (works well for Llama and GPT models) ───────────
+
 SYSTEM_PROMPT = (
     "You are an expert emergency medicine physician and clinical pharmacist. "
-    "You have 20 years of experience in emergency triage and pharmacology. "
-    "Analyze the patient case carefully and respond ONLY with a valid JSON object "
-    "exactly matching the requested schema. "
-    "Do not include any explanation, markdown formatting, or text outside the JSON. "
-    "Start your response directly with { and end with }."
+    "Analyze the patient case and respond ONLY with a valid JSON object "
+    "matching the requested schema. No explanation, no markdown, just JSON."
 )
- 
- 
-def call_llm(prompt: str, max_retries: int = 2) -> str:
-    """Call the LLM API and return the response text. Retries on failure."""
-    for attempt in range(max_retries + 1):
+
+TASK_NAMES = {
+    "T1_vitals":                 "vital_signs_extraction",
+    "T2_drug_interactions":      "drug_interaction_flagging",
+    "T3_differential_diagnosis": "differential_diagnosis_ranking",
+}
+
+
+def call_llm(prompt: str) -> str:
+    for attempt in range(3):
         try:
             response = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -65,139 +56,62 @@ def call_llm(prompt: str, max_retries: int = 2) -> str:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"  [retry {attempt+1}] API error: {e}. Retrying in {wait}s...", file=sys.stderr)
-                time.sleep(wait)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
             else:
                 raise
- 
- 
-def run_task(task_id: str, seed: int = 42) -> dict:
-    """Run all cases for one task. Returns per-case scores and mean."""
-    mod = TASKS[task_id]
-    n_cases = len(mod.CASES)
-    case_results = []
- 
-    for case_idx in range(n_cases):
-        env = MedTriageEnv(task_id=task_id, case_idx=case_idx, seed=seed)
-        obs = env.reset()
-        prompt = obs.to_prompt()
-        patient_id = obs.patient.patient_id
- 
-        t0 = time.time()
-        try:
-            response = call_llm(prompt)
-        except Exception as e:
-            response = "{}"
-            print(f"  LLM call failed for {task_id} case {case_idx}: {e}", file=sys.stderr)
-        elapsed = round(time.time() - t0, 2)
- 
-        action = Action(task_id=task_id, content=response)
-        _, reward, done, info = env.step(action)
- 
-        step_log = {
-            "type":             "STEP",
-            "task_id":          task_id,
-            "case_idx":         case_idx,
-            "patient_id":       patient_id,
-            "score":            reward.value,
-            "reward_breakdown": reward.breakdown,
-            "feedback":         reward.feedback,
-            "latency_s":        elapsed,
-            "model":            MODEL_NAME,
-        }
-        print(json.dumps(step_log), flush=True)
- 
-        bar = "#" * int(reward.value * 20) + "-" * (20 - int(reward.value * 20))
-        print(f"  [{bar}] {reward.value:.4f}  {task_id} case {case_idx} ({patient_id}) [{elapsed}s]", file=sys.stderr)
- 
-        case_results.append(reward.value)
- 
-    return {
-        "task_id":    task_id,
-        "scores":     case_results,
-        "mean_score": round(sum(case_results) / len(case_results), 4),
-        "n_cases":    n_cases,
-    }
- 
- 
+
+
 def main():
-    run_id = f"medtriage_{int(time.time())}"
-    seed = 42
- 
-    print(json.dumps({
-        "type":      "START",
-        "run_id":    run_id,
-        "model":     MODEL_NAME,
-        "api_base":  API_BASE_URL,
-        "tasks":     TASK_ORDER,
-        "seed":      seed,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }), flush=True)
- 
-    print(f"\nMedTriageEnv Baseline — {MODEL_NAME}", file=sys.stderr)
-    print(f"API: {API_BASE_URL}", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
- 
-    all_results = {}
-    total_scores = []
-    errors = []
- 
-    difficulty = {
-        "T1_vitals":                 "Easy  ",
-        "T2_drug_interactions":      "Medium",
-        "T3_differential_diagnosis": "Hard  ",
-    }
- 
+    overall_scores = []
+
     for task_id in TASK_ORDER:
-        print(f"\n[{difficulty[task_id]}] {task_id}", file=sys.stderr)
-        try:
-            result = run_task(task_id, seed=seed)
-            all_results[task_id] = result
-            total_scores.extend(result["scores"])
-            print(f"  -> mean score: {result['mean_score']:.4f}", file=sys.stderr)
-        except Exception as e:
-            err = {"task_id": task_id, "error": str(e), "traceback": traceback.format_exc()}
-            errors.append(err)
-            print(json.dumps({"type": "STEP", "task_id": task_id, "error": str(e)}), flush=True)
-            print(f"  ERROR: {e}", file=sys.stderr)
- 
-    overall_mean = round(sum(total_scores) / len(total_scores), 4) if total_scores else 0.0
- 
-    print(json.dumps({
-        "type":               "END",
-        "run_id":             run_id,
-        "model":              MODEL_NAME,
-        "overall_mean_score": overall_mean,
-        "task_results": {
-            tid: {"mean_score": r["mean_score"], "scores": r["scores"], "n_cases": r["n_cases"]}
-            for tid, r in all_results.items()
-        },
-        "errors":    errors,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }), flush=True)
- 
-    print("\n" + "=" * 60, file=sys.stderr)
-    print("FINAL SCORES", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
-    for task_id, result in all_results.items():
-        diff = difficulty.get(task_id, "?")
-        scores_str = ", ".join(f"{s:.4f}" for s in result["scores"])
-        print(f"  [{diff}] {task_id}", file=sys.stderr)
-        print(f"           scores: [{scores_str}]", file=sys.stderr)
-        print(f"           mean:   {result['mean_score']:.4f}", file=sys.stderr)
- 
-    print(f"\n  OVERALL MEAN: {overall_mean:.4f}", file=sys.stderr)
- 
-    if errors:
-        print(f"\n  ERRORS ({len(errors)}):", file=sys.stderr)
-        for e in errors:
-            print(f"    - {e['task_id']}: {e['error']}", file=sys.stderr)
- 
-    print("=" * 60, file=sys.stderr)
-    return 0 if not errors else 1
- 
- 
+        task_name = TASK_NAMES[task_id]
+        mod = TASKS[task_id]
+        n_cases = len(mod.CASES)
+
+        # ── [START] ──────────────────────────────────────────────
+        print(f"[START] task={task_name} model={MODEL_NAME} cases={n_cases}", flush=True)
+
+        task_scores = []
+
+        for case_idx in range(n_cases):
+            step_num = case_idx + 1
+
+            env = MedTriageEnv(task_id=task_id, case_idx=case_idx, seed=42)
+            obs = env.reset()
+            prompt = obs.to_prompt()
+
+            try:
+                response = call_llm(prompt)
+            except Exception as e:
+                response = "{}"
+                print(f"[STEP] task={task_name} step={step_num} reward=0.0 error={str(e)}", flush=True)
+                task_scores.append(0.0)
+                continue
+
+            action = Action(task_id=task_id, content=response)
+            _, reward, done, info = env.step(action)
+
+            score = reward.value
+            task_scores.append(score)
+
+            # ── [STEP] ───────────────────────────────────────────
+            print(f"[STEP] task={task_name} step={step_num} reward={score:.4f} done={done}", flush=True)
+
+        task_mean = round(sum(task_scores) / len(task_scores), 4) if task_scores else 0.0
+        overall_scores.extend(task_scores)
+
+        # ── [END] ────────────────────────────────────────────────
+        print(f"[END] task={task_name} score={task_mean} steps={n_cases}", flush=True)
+
+    overall = round(sum(overall_scores) / len(overall_scores), 4) if overall_scores else 0.0
+
+    # Final summary to stderr (human readable)
+    print("\n" + "=" * 50, file=sys.stderr)
+    print(f"OVERALL MEAN SCORE: {overall:.4f}", file=sys.stderr)
+    print("=" * 50, file=sys.stderr)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
